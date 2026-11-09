@@ -4,7 +4,7 @@ Backend for a kindergarten kitchen: it tracks food products in stock, meal recip
 
 ## Features
 
-- **Auth & roles** — registration, login and token refresh with JWT; roles: `admin`, `manager`, `cook`
+- **Auth & roles** — registration, login and token refresh with JWT; roles: `admin`, `manager`, `cook`. Public sign-up creates cook accounts only; admin/manager accounts are created by an admin (the first user of an empty system becomes admin)
 - **Products** — CRUD for food products and their stock
 - **Meals** — CRUD for meals and their ingredients
 - **Serving meals** — `POST /serve-meal` records a serving and deducts ingredients from inventory
@@ -72,6 +72,5 @@ pytest
 | Variable | Description |
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string (`postgresql+asyncpg://...`) |
-| `SECRET_KEY` | Application secret |
-| `JWT_SECRET` | Secret used to sign JWT tokens |
-| `REDIS_URL` | Redis connection string for Celery |
+| `SECRET_KEY` | Secret used to sign JWT tokens |
+| `REDIS_URL` | Redis connection string (Celery broker + WebSocket pub/sub) |
