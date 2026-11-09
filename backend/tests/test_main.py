@@ -2,7 +2,7 @@ import random
 import pytest
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from app.main import app
 from app.models import User
 
@@ -14,8 +14,9 @@ async def test_read_root(client):
 
 @pytest.mark.asyncio
 async def test_register_and_login(client, db_session):
-    # Clear users to ensure a clean slate for this test
-    await db_session.execute("DELETE FROM users")
+    # Empty system: the very first user is allowed to become admin (bootstrap)
+    await db_session.execute(text("DELETE FROM meal_ingredients"))
+    await db_session.execute(text("DELETE FROM users"))
     await db_session.commit()
 
     username = f"testuser_{random.randint(1, 100000)}"

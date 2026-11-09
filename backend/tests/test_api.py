@@ -13,124 +13,6 @@ from app.models import User, Product, Meal, MealIngredient, MealServing, Invento
 from app.auth import get_password_hash
 from app.celery_app import celery_app
 
-# --- 1) Set up in-memory SQLite and override get_db ----
-SQLALCHEMY_TEST_URL = "sqlite+aiosqlite:///:memory:"
-engine = create_async_engine(SQLALCHEMY_TEST_URL, echo=False)
-TestingSessionLocal = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
-)
-
-@pytest_asyncio.fixture(scope="session", autouse=True)
-async def prepare_database():
-    # create all tables once
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    # drop all at end
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-
-@pytest_asyncio.fixture
-async def db_session():
-    async with TestingSessionLocal() as session:
-        yield session
-
-
-@pytest_asyncio.fixture
-async def client(db_session: AsyncSession, monkeypatch):
-     # override init_db to a no-op so our TestClient never hits the real DATABASE_URL
-     import app.main as main_module
-     async def _noop_init_db():
-         return
-     monkeypatch.setattr(main_module, "init_db", _noop_init_db)
-
-     # override the DB dependency to use our in-memory SQLite
-     async def _get_db():
-         yield db_session
-     app.dependency_overrides[get_db] = _get_db
-
-     # patch celery to synchronous dummy
-     class DummyTask:
-         def __init__(self, id): self.id = id
-     monkeypatch.setattr(celery_app, 'send_task', lambda name, *args, **kwargs: DummyTask(id="task-123"))
-     class DummyResult:
-         def __init__(self, result): self._result = result
-         def ready(self): return True
-         def failed(self): return False
-         def get(self, propagate=True): return self._result
-     monkeypatch.setattr(celery_app, 'AsyncResult', lambda tid: DummyResult({"foo": "bar"}))
-
-     transport = ASGITransport(app=app)
-     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-         yield ac
-
-
-# --- 2) Seed a clean state before each test ---
-@pytest_asyncio.fixture(autouse=True)
-async def seed_data(db_session: AsyncSession):
-    # wipe every table
-    for tbl in (
-        "meal_servings", "inventory_logs", "meal_ingredients",
-        "meals", "products", "users"
-    ):
-        await db_session.execute(text(f"DELETE FROM {tbl}"))
-    await db_session.commit()
-
-    # create two users: admin & cook
-    admin = User(
-        username="adminuser",
-        password_hash=get_password_hash("adminpass"),
-        role="admin"
-    )
-    cook = User(
-        username="cookuser",
-        password_hash=get_password_hash("cookpass"),
-        role="cook"
-    )
-    db_session.add_all([admin, cook])
-    await db_session.commit()
-
-    # one product + one meal + one ingredient
-    prod = Product(
-        name="Milk",
-        quantity=100.0,
-        threshold=10.0,
-        delivery_date=datetime.now()
-    )
-    meal = Meal(name="Breakfast")
-    db_session.add_all([prod, meal])
-    await db_session.commit()
-
-    ing = MealIngredient(
-        meal_id=meal.id,
-        product_id=prod.id,
-        quantity=50.0
-    )
-    db_session.add(ing)
-    await db_session.commit()
-
-    yield
-    await db_session.rollback()
-
-# --- 3) Helpers to grab JWT tokens ---
-@pytest_asyncio.fixture
-async def admin_token(client: AsyncClient):
-    r = await client.post(
-        "/login",
-        data={"username":"adminuser","password":"adminpass"}
-    )
-    assert r.status_code == 200
-    return r.json()["access_token"]
-
-@pytest_asyncio.fixture
-async def cook_token(client: AsyncClient):
-    r = await client.post(
-        "/login",
-        data={"username":"cookuser","password":"cookpass"}
-    )
-    assert r.status_code == 200
-    return r.json()["access_token"]
-
 # --- 4) Comprehensive Tests ---
 
 @pytest.mark.asyncio
@@ -277,22 +159,117 @@ async def test_servings_log(client, admin_token, db_session):
     assert r.status_code == 200
     assert isinstance(r.json(), list)
 
-@pytest.mark.asyncio
-async def test_websocket_inventory_endpoints(client, cook_token, admin_token):
+class _FakePubSub:
+    """Stands in for redis pub/sub: yields one inventory message, then stops."""
+
+    async def subscribe(self, channel):
+        self.channel = channel
+
+    async def unsubscribe(self, channel):
+        pass
+
+    async def listen(self):
+        yield {"type": "subscribe", "channel": self.channel, "data": 1}
+        yield {"type": "message", "channel": self.channel, "data": "Inventory updated: 50.0g of 1"}
+
+
+class _FakeRedis:
+    def pubsub(self):
+        return _FakePubSub()
+
+    async def aclose(self):
+        pass
+
+
+def test_websocket_inventory_endpoints(session_factory, monkeypatch):
     from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+    from app.auth import create_access_token
 
-    # cook is not authorized → handshake still succeeds but server immediately closes.
-    with TestClient(app) as tc:
-        ws = tc.websocket_connect(f"/ws/inventory?token={cook_token}", timeout=1)
-        # as soon as we try to receive, it will have been closed:
-        with pytest.raises(Exception):
-            ws.receive_json()
+    async def _get_db():
+        async with session_factory() as session:
+            yield session
 
-    # admin *is* authorized → we can open the socket and then close cleanly
-    with TestClient(app) as tc:
-        with tc.websocket_connect(f"/ws/inventory?token={admin_token}") as ws:
-            # the connection object should report CONNECTED
-            assert ws.client_state == ws.client_state.CONNECTED
-            # then explicitly close from client side
-            ws.close()
+    async def _noop_init_db():
+        return None
 
+    monkeypatch.setattr(main_module, "init_db", _noop_init_db)
+    monkeypatch.setattr(main_module.redis, "from_url", lambda *a, **kw: _FakeRedis())
+    app.dependency_overrides[get_db] = _get_db
+    try:
+        with TestClient(app) as tc:
+            # invalid token -> closed with policy violation
+            with pytest.raises(WebSocketDisconnect):
+                with tc.websocket_connect("/ws/inventory?token=invalid") as ws:
+                    ws.receive_json()
+
+            # cook is not allowed to watch inventory
+            cook_token = create_access_token({"sub": "cookuser"})
+            with pytest.raises(WebSocketDisconnect):
+                with tc.websocket_connect(f"/ws/inventory?token={cook_token}") as ws:
+                    ws.receive_json()
+
+            # admin receives the published inventory update
+            admin_token = create_access_token({"sub": "adminuser"})
+            with tc.websocket_connect(f"/ws/inventory?token={admin_token}") as ws:
+                data = ws.receive_json()
+                assert data["channel"] == "inventory_updates"
+                assert "Inventory updated" in data["data"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_update_and_delete_meal_and_product(client, admin_token):
+    """Regression test: these used an invalid select().delete() and an un-awaited db.delete()."""
+    headers = {"Authorization": f"Bearer {admin_token}"}
+
+    r = await client.put("/meals/1", json={"name": "Big Breakfast", "ingredients": [{"meal_id": 1, "product_id": 1, "quantity": 20.0}]}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == "Big Breakfast"
+
+    r = await client.delete("/meals/1", headers=headers)
+    assert r.status_code == 200, r.text
+    assert (await client.get("/meals/1", headers=headers)).status_code == 404
+
+    r = await client.delete("/products/1", headers=headers)
+    assert r.status_code == 200, r.text
+    assert (await client.get("/products/1", headers=headers)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_all_main_routes_are_registered(client):
+    """Regression test: a second FastAPI() at the end of main.py used to hide these routes."""
+    paths = {route.path for route in client._transport.app.routes}
+    for expected in ["/register", "/login", "/meals", "/serve-meal", "/usage-report", "/ws/inventory", "/patterns/actions"]:
+        assert expected in paths
+
+
+@pytest.mark.asyncio
+async def test_cannot_self_register_as_admin_or_manager(client, cook_token):
+    """Security: anonymous users and non-admins must not be able to create privileged accounts."""
+    for role in ("admin", "manager"):
+        r = await client.post("/register", json={"username": f"hacker_{role}", "password": "hackpass1", "role": role})
+        assert r.status_code == 403, r.text
+
+        r = await client.post(
+            "/register",
+            json={"username": f"cook_made_{role}", "password": "hackpass1", "role": role},
+            headers={"Authorization": f"Bearer {cook_token}"},
+        )
+        assert r.status_code == 403, r.text
+
+    # public sign-up as cook is still allowed
+    r = await client.post("/register", json={"username": "newcook", "password": "cookpass1", "role": "cook"})
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_admin_can_create_manager(client, admin_token):
+    r = await client.post(
+        "/register",
+        json={"username": "newmanager", "password": "managerpass", "role": "manager"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["role"] == "manager"

@@ -1,4 +1,5 @@
 import pytest
+from sqlalchemy import select
 from httpx import AsyncClient
 import asyncio
 import websockets
@@ -9,13 +10,14 @@ from celery.result import AsyncResult
 import json
 
 @pytest.mark.asyncio
-async def test_register(client):
-    response = await client.post("/register", json={"username": "testuser", "password": "testpass123", "role": "manager"})
+async def test_register(client, admin_token):
+    admin = {"Authorization": f"Bearer {admin_token}"}
+    response = await client.post("/register", json={"username": "testuser", "password": "testpass123", "role": "manager"}, headers=admin)
     assert response.status_code == 200
     assert response.json()["message"] == "User registered successfully"
     assert response.json()["role"] == "manager"
 
-    response = await client.post("/register", json={"username": "testuser", "password": "testpass123", "role": "manager"})
+    response = await client.post("/register", json={"username": "testuser", "password": "testpass123", "role": "manager"}, headers=admin)
     assert response.status_code == 400
     assert response.json()["detail"] == "Username already registered"
 
@@ -103,13 +105,20 @@ async def test_serve_meal(client, admin_token, cook_token, db_session):
     print(f"Product quantity after serving: {product.quantity}")
     assert product.quantity == 50.0  # 100 - 50
 
-    response = await client.post("/serve-meal", json=meal_serving.dict(), headers={"Authorization": f"Bearer {cook_token}"})
-    print(f"POST /serve-meal (insufficient) response: {response.json()}")
+    # 50g left and the meal needs 50g -> one more serving is still possible
+    response = await client.post("/serve-meal", json=meal_serving.model_dump(), headers={"Authorization": f"Bearer {cook_token}"})
+    assert response.status_code == 200
+
+    # stock is now 0 -> not enough for another portion
+    response = await client.post("/serve-meal", json=meal_serving.model_dump(), headers={"Authorization": f"Bearer {cook_token}"})
     assert response.status_code == 400
     assert "Insufficient quantity" in response.json()["detail"]
 
-    response = await client.post("/serve-meal", json=meal_serving.dict(), headers={"Authorization": f"Bearer {admin_token}"})
-    print(f"POST /serve-meal (unauthorized) response: {response.json()}")
+    # managers can view reports but are not allowed to serve meals
+    await client.post("/register", json={"username": "manager1", "password": "managerpass", "role": "manager"}, headers={"Authorization": f"Bearer {admin_token}"})
+    login = await client.post("/login", data={"username": "manager1", "password": "managerpass"})
+    manager_token = login.json()["access_token"]
+    response = await client.post("/serve-meal", json=meal_serving.model_dump(), headers={"Authorization": f"Bearer {manager_token}"})
     assert response.status_code == 403
 
 @pytest.mark.asyncio
@@ -120,42 +129,38 @@ async def test_portion_estimates(client, admin_token):
     assert any(m["meal_id"] == 1 for m in response.json())
 
 @pytest.mark.asyncio
-async def test_generate_report(client, admin_token, db_session):
+async def test_generate_report(client, admin_token, db_session, monkeypatch):
     log = InventoryLog(product_id=1, change_type="delivery", quantity=10.0, user_id=1, timestamp=datetime.now())
     db_session.add(log)
     await db_session.commit()
 
     response = await client.post("/generate-report", headers={"Authorization": f"Bearer {admin_token}"})
-    print(f"POST /generate-report response: {response.json()}")
     assert response.status_code == 200
     task_id = response.json()["task_id"]
     assert task_id
 
-    for _ in range(40):
-        response = await client.get(f"/report/{task_id}", headers={"Authorization": f"Bearer {admin_token}"})
-        print(f"Polling status for task {task_id}: {response.json()}")
-        if response.json()["status"] == "completed":
-            break
-        await asyncio.sleep(1)
+    from app.celery_app import celery_app
+    from tests.conftest import _DummyResult
+    monkeypatch.setattr(celery_app, "AsyncResult", lambda tid: _DummyResult({"report": {"total_used": 10.0}}))
+    response = await client.get(f"/report/{task_id}", headers={"Authorization": f"Bearer {admin_token}"})
     assert response.status_code == 200
-    assert response.json()["status"] == "completed"
+    assert response.json()["status"] == "SUCCESS"
     assert "report" in response.json()["result"]
 
 @pytest.mark.asyncio
-async def test_notifications(client, admin_token, db_session):
+async def test_notifications(client, admin_token, monkeypatch):
     response = await client.get("/notifications", headers={"Authorization": f"Bearer {admin_token}"})
     assert response.status_code == 200
     assert "low_inventory" in response.json()
     task_id = response.json()["discrepancy_task_id"]
     assert task_id
 
-    for _ in range(20):
-        response = await client.get(f"/discrepancy/{task_id}", headers={"Authorization": f"Bearer {admin_token}"})
-        if response.json()["status"] == "completed":
-            break
-        await asyncio.sleep(1)
+    from app.celery_app import celery_app
+    from tests.conftest import _DummyResult
+    monkeypatch.setattr(celery_app, "AsyncResult", lambda tid: _DummyResult({"discrepancy_rate": 0.0}))
+    response = await client.get(f"/discrepancy/{task_id}", headers={"Authorization": f"Bearer {admin_token}"})
     assert response.status_code == 200
-    assert response.json()["status"] == "completed"
+    assert response.json()["status"] == "SUCCESS"
     assert "discrepancy_rate" in response.json()["result"]
 
 @pytest.mark.asyncio
@@ -185,25 +190,8 @@ async def test_servings_log(client, admin_token, db_session):
     assert response.status_code == 200
 
 @pytest.mark.asyncio
-async def test_websocket_inventory(client, cook_token, db_session):
-    uri = f"ws://localhost:8000/ws/inventory?token={cook_token}"
-    async with websockets.connect(uri) as websocket:
-        meal_serving = MealServingCreate(meal_id=1)
-        response = await client.post("/serve-meal", json=meal_serving.dict(), headers={"Authorization": f"Bearer {cook_token}"})
-        print(f"POST /serve-meal response: {response.json()}")
-        assert response.status_code == 200
-
-        message = await websocket.recv()
-        data = json.loads(message)
-        print(f"WebSocket message: {data}")
-        assert data["channel"] == "inventory_updates"
-        assert "Inventory updated" in data["data"]
-
-    # Test unauthorized access
-    uri_invalid = f"ws://localhost:8000/ws/inventory?token=invalid_token"
-    try:
-        async with websockets.connect(uri_invalid) as websocket:
-            await asyncio.wait_for(websocket.recv(), timeout=1.0)
-            pytest.fail("Expected connection to close due to invalid token")
-    except websockets.exceptions.ConnectionClosed:
-        pass
+async def test_serve_meal_publishes_inventory_update(client, cook_token, published_messages):
+    """Serving a meal must publish an update (consumed by the /ws/inventory socket)."""
+    response = await client.post("/serve-meal", json={"meal_id": 1}, headers={"Authorization": f"Bearer {cook_token}"})
+    assert response.status_code == 200
+    assert published_messages and "Inventory updated" in published_messages[0]
