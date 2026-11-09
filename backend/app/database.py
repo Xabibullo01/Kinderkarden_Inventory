@@ -5,16 +5,18 @@ from sqlalchemy import create_engine
 from dotenv import load_dotenv
 import os
 
+from .config import SQL_ECHO
+
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set")
 
 # Async engine for FastAPI
-engine = create_async_engine(DATABASE_URL, echo=True)
+engine = create_async_engine(DATABASE_URL, echo=SQL_ECHO)
 
 # Sync engine for Celery
-sync_engine = create_engine(DATABASE_URL.replace("postgresql+asyncpg", "postgresql+psycopg2"), echo=True)
+sync_engine = create_engine(DATABASE_URL.replace("postgresql+asyncpg", "postgresql+psycopg2"), echo=SQL_ECHO)
 
 # Async session factory
 # Async session factory

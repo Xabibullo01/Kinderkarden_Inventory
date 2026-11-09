@@ -36,18 +36,18 @@ class CookAuthorizationHandler(AuthorizationHandler):
 # Factory Pattern: Abstract Factory for Products and Meals
 class ItemFactory(ABC):
     @abstractmethod
-    async def create(self, db, item_data):
+    async def create(self, db, item_data, user_id=None):
         pass
 
 
 class ProductFactory(ItemFactory):
-    async def create(self, db, item_data):
+    async def create(self, db, item_data, user_id=None):
         from .crud import create_product
-        return await create_product(db, item_data)
+        return await create_product(db, item_data, user_id)
 
 
 class MealFactory(ItemFactory):
-    async def create(self, db, item_data):
+    async def create(self, db, item_data, user_id=None):
         from .crud import create_meal
         return await create_meal(db, item_data)
 
@@ -64,9 +64,13 @@ class DatabaseSource(DataSource):
         self.db = db
 
     async def get_data(self):
+        from sqlalchemy import select
         from .models import Product
-        result = await self.db.execute("SELECT * FROM products")  # example raw query
-        return result.scalars().all()
+        result = await self.db.execute(select(Product))
+        return [
+            {"id": p.id, "name": p.name, "quantity": p.quantity, "threshold": p.threshold}
+            for p in result.scalars().all()
+        ]
 
 
 class CacheSource(DataSource):

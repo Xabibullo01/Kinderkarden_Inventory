@@ -14,15 +14,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from jose import jwt, JWTError
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
-from .schemas import Product
 from .models import User, InventoryLog, MealServing, Product, Meal
 from .auth import (
     verify_password,
     get_password_hash,
     create_access_token,
     get_current_user,
+    get_optional_user,
     authenticate_user,
     pwd_context,
+    SECRET_KEY as AUTH_SECRET_KEY,
+    ALGORITHM,
 )
 from .crud import (
     create_product,
@@ -37,7 +39,7 @@ from .crud import (
     get_portion_estimates,
 )
 from .schemas import (
-    Product,
+    ProductCreate,
     ProductSchema,
     MealCreate,
     MealSchema,
@@ -50,17 +52,15 @@ from .schemas import (
 )
 from .database import init_db, get_db
 from celery.result import AsyncResult
-from sqlalchemy import select
+from sqlalchemy import func, select
 from typing import Optional, List
 from datetime import timedelta, datetime, timezone
 from dotenv import load_dotenv
 import redis.asyncio as redis
 import os
 from .celery_app import celery_app
-from starlette.testclient import WebSocketTestSession
-from starlette.websockets import WebSocketState
-
-WebSocketTestSession.client_state = WebSocketState.CONNECTED
+from .config import INVENTORY_CHANNEL, REDIS_URL
+from .patterns_demo import router as patterns_router
 logger = logging.getLogger(__name__)
 
 # load .env first thing
@@ -71,12 +71,10 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 if SECRET_KEY is None:
     raise ValueError("SECRET_KEY environment variable not set")
 
-JWT_SECRET = os.getenv("JWT_SECRET")
-if JWT_SECRET is None:
-    raise ValueError("JWT_SECRET environment variable not set")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+PRIVILEGED_ROLES = {"admin", "manager"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -93,6 +91,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(patterns_router)
 
 @app.get("/")
 async def read_root():
@@ -100,8 +99,15 @@ async def read_root():
 
 @app.post("/register")
 async def register(
-    form_data: UserCreate, db: AsyncSession = Depends(get_db)
+    form_data: UserCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
+    """Public sign-up creates only "cook" accounts.
+
+    Privileged roles (admin, manager) can only be created by an existing admin.
+    Exception: the very first user of an empty system may become admin (bootstrap).
+    """
     db_user = await db.execute(
         select(User).where(User.username == form_data.username)
     )
@@ -112,6 +118,15 @@ async def register(
         raise HTTPException(
             status_code=400, detail=f"Invalid role. Must be one of {VALID_ROLES}"
         )
+    if form_data.role in PRIVILEGED_ROLES:
+        user_count = await db.scalar(select(func.count()).select_from(User))
+        is_bootstrap = user_count == 0
+        is_admin = current_user is not None and current_user.role == "admin"
+        if not (is_bootstrap or is_admin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only an admin can create admin or manager accounts",
+            )
     hashed_password = pwd_context.hash(form_data.password)
     new_user = User(
         username=form_data.username,
@@ -121,7 +136,11 @@ async def register(
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
-    return {"username": new_user.username, "role": new_user.role}
+    return {
+        "message": "User registered successfully",
+        "username": new_user.username,
+        "role": new_user.role,
+    }
 
 @app.post("/login")
 async def login(
@@ -167,13 +186,13 @@ async def get_products(
 
 @app.post("/products", response_model=ProductSchema)
 async def create_new_product(
-    product: Product,
+    product: ProductCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     if current_user.role not in ["admin", "manager"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    return await create_product(db, product)
+    return await create_product(db, product, current_user.id)
 
 @app.get("/products/{product_id}", response_model=ProductSchema)
 async def read_product(
@@ -189,13 +208,13 @@ async def read_product(
 @app.put("/products/{product_id}", response_model=ProductSchema)
 async def update_existing_product(
     product_id: int,
-    product: Product,
+    product: ProductCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     if current_user.role not in ["admin", "manager"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    updated_product = await update_product(db, product_id, product)
+    updated_product = await update_product(db, product_id, product, current_user.id)
     if not updated_product:
         raise HTTPException(status_code=404, detail="Product not found")
     return updated_product
@@ -208,7 +227,7 @@ async def delete_existing_product(
 ):
     if current_user.role not in ["admin", "manager"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    product = await delete_product(db, product_id)
+    product = await delete_product(db, product_id, current_user.id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     return {"message": "Product deleted"}
@@ -434,12 +453,9 @@ async def websocket_inventory(
     websocket: WebSocket, token: str, db: AsyncSession = Depends(get_db)
 ):
     try:
-        if JWT_SECRET is None:
-            await websocket.close(code=1011, reason="Internal server error")
-            return
-
         try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            # Same key/algorithm that signed the token in auth.create_access_token
+            payload = jwt.decode(token, AUTH_SECRET_KEY, algorithms=[ALGORITHM])
             username: str = payload.get("sub")
             if username is None:
                 await websocket.close(code=1008, reason="Invalid token")
@@ -455,11 +471,11 @@ async def websocket_inventory(
             return
 
         await websocket.accept()
-        redis_client = await redis.from_url(
-            "redis://redis:6379/0", encoding="utf-8", decode_responses=True
+        redis_client = redis.from_url(
+            REDIS_URL, encoding="utf-8", decode_responses=True
         )
         pubsub = redis_client.pubsub()
-        await pubsub.subscribe("inventory_updates")
+        await pubsub.subscribe(INVENTORY_CHANNEL)
 
         try:
             async for message in pubsub.listen():
@@ -470,86 +486,9 @@ async def websocket_inventory(
         except WebSocketDisconnect:
             logger.info(f"WebSocket disconnected for user {user.username}")
         finally:
-            await pubsub.unsubscribe("inventory_updates")
+            await pubsub.unsubscribe(INVENTORY_CHANNEL)
             await redis_client.aclose()
     except Exception as e:
         logger.error(f"WebSocket setup error: {e}")
         await websocket.close(code=1011, reason="Internal error")
         raise
-
-
-
-
-
-
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from .models import User
-from .schemas import Product, ProductSchema
-from .database import get_db
-from .auth import get_current_user
-
-# Import patternlar reporting.py dan
-from .reporting import (
-    AuthorizationHandler,
-    AdminAuthorizationHandler,
-    ManagerAuthorizationHandler,
-    CookAuthorizationHandler,
-    ProductFactory,
-    MealFactory,
-    DatabaseSource,
-    CacheSource,
-)
-
-app = FastAPI()
-
-# Misol: Chain of Responsibility bilan authorization tekshirish uchun funksiya
-async def check_authorization(user: User, action: str) -> bool:
-    handler_chain = AdminAuthorizationHandler(
-        ManagerAuthorizationHandler(
-            CookAuthorizationHandler(None)
-        )
-    )
-    return await handler_chain.handle(user, action)
-
-# Eski kod: oddiy status endpoint
-@app.get("/")
-async def root():
-    return {"message": "Welcome to the API"}
-
-# Mahsulot yaratish, Factory pattern ishlatilgan
-@app.post("/products", response_model=ProductSchema)
-async def create_product_endpoint(
-    product: Product,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    # Chain of responsibility orqali authorization
-    is_authorized = await check_authorization(current_user, "edit")
-    if not is_authorized:
-        raise HTTPException(status_code=403, detail="Not authorized to create product")
-
-    factory = ProductFactory()
-    created_product = await factory.create(db, product)
-    return created_product
-
-# Masalan, ma'lumot olish uchun Bridge pattern misoli
-@app.get("/products")
-async def get_products(
-    db: AsyncSession = Depends(get_db),
-):
-    db_source = DatabaseSource(db)
-    products = await db_source.get_data()
-    return {"products": products}
-
-# Protected action uchun Chain of Responsibility dan foydalanish
-@app.post("/actions")
-async def perform_action(
-    action: str,
-    current_user: User = Depends(get_current_user),
-):
-    authorized = await check_authorization(current_user, action)
-    if not authorized:
-        raise HTTPException(status_code=403, detail="Not authorized for this action")
-
-    return {"message": f"Action '{action}' permitted for user {current_user.username}"}

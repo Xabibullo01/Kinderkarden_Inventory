@@ -1,10 +1,10 @@
 from celery import Celery
-from dotenv import load_dotenv
 import os
 
-load_dotenv()
+from .config import REDIS_URL
 
-celery_app = Celery('tasks', broker='redis://redis:6379/0', backend='redis://redis:6379/0')
+# include=... makes the worker import app.tasks, otherwise it doesn't know any task.
+celery_app = Celery('tasks', broker=REDIS_URL, backend=REDIS_URL, include=['app.tasks'])
 
 
 celery_app.conf.update(
@@ -14,6 +14,7 @@ celery_app.conf.update(
     timezone='UTC',
     enable_utc=True,
     broker_connection_retry_on_startup=True,
-    task_always_eager=True,
+    # Eager mode runs tasks inside the API process. Only enable it for local debugging/tests.
+    task_always_eager=os.getenv("CELERY_TASK_ALWAYS_EAGER", "false").lower() == "true",
     task_eager_propagates=True,
 )
